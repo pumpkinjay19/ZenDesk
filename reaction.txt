@@ -1,0 +1,283 @@
+"""
+Reaction Test — standalone test
+5 rounds → shows average at end
+B1 (GPIO5) = Press when screen flashes
+B2 (GPIO6) = Menu / back
+"""
+import spidev, RPi.GPIO as GPIO
+from PIL import Image, ImageDraw, ImageFont
+import time, math, random
+
+DC, RST, CS   = 24, 25, 8
+WIDTH, HEIGHT = 240, 320
+BTN1, BTN2    = 5, 6
+
+BG_DARK      = (18,  12,  35)
+BG_MID       = (32,  20,  58)
+PURPLE_DEEP  = (88,  44, 130)
+PURPLE_MID   = (140, 82, 200)
+PURPLE_LIGHT = (196, 154, 240)
+PINK_HOT     = (255,  80, 160)
+MINT         = (100, 230, 180)
+GOLD         = (255, 210,  80)
+WHITE        = (255, 255, 255)
+RED          = (220,  60,  60)
+
+ROUNDS   = 5
+MIN_WAIT = 1.8    # minimum delay before flash (seconds)
+MAX_WAIT = 4.5    # maximum delay before flash
+GREAT_MS = 220
+GOOD_MS  = 380
+OK_MS    = 550
+
+# ══════════════════════════════════════════════════════════════
+# HARDWARE
+# ══════════════════════════════════════════════════════════════
+
+def init_hw():
+    GPIO.setmode(GPIO.BCM)
+    for p in (DC,RST,CS):  GPIO.setup(p, GPIO.OUT)
+    for p in (BTN1,BTN2):  GPIO.setup(p, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    spi=spidev.SpiDev(); spi.open(0,0)
+    spi.max_speed_hz=16_000_000; spi.mode=0
+    return spi
+
+def cleanup(spi):
+    try: GPIO.cleanup()
+    except: pass
+    try: spi.close()
+    except: pass
+
+def _cmd(spi,c):
+    GPIO.output(CS,0); GPIO.output(DC,0); spi.writebytes([c]); GPIO.output(CS,1)
+
+def _data(spi,d):
+    GPIO.output(CS,0); GPIO.output(DC,1); spi.writebytes([d]); GPIO.output(CS,1)
+
+def init_display(spi):
+    GPIO.output(RST,0); time.sleep(0.1)
+    GPIO.output(RST,1); time.sleep(0.2)
+    _cmd(spi,0x01); time.sleep(0.2)
+    _cmd(spi,0x11); time.sleep(0.12)
+    _cmd(spi,0x3A); _data(spi,0x55)
+    _cmd(spi,0x36); _data(spi,0xC8)
+    _cmd(spi,0x29)
+
+def show(spi, img):
+    img=img.convert("RGB"); px=list(img.getdata())
+    _cmd(spi,0x2A)
+    for b in (0x00,0x00,0x00,0xEF): _data(spi,b)
+    _cmd(spi,0x2B)
+    for b in (0x00,0x00,0x01,0x3F): _data(spi,b)
+    _cmd(spi,0x2C)
+    GPIO.output(CS,0); GPIO.output(DC,1)
+    buf=[]
+    for r,g,b in px:
+        c=((r&0xF8)<<8)|((g&0xFC)<<3)|(b>>3)
+        buf+=[(c>>8)&0xFF,c&0xFF]
+        if len(buf)>=4096: spi.writebytes2(buf); buf=[]
+    if buf: spi.writebytes2(buf)
+    GPIO.output(CS,1)
+
+def font(size):
+    for p in ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+              "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"]:
+        try: return ImageFont.truetype(p,size)
+        except: pass
+    return ImageFont.load_default()
+
+def btn1(): return GPIO.input(BTN1)==GPIO.LOW
+def btn2(): return GPIO.input(BTN2)==GPIO.LOW
+
+def poll(n=10, gap=0.010):
+    for _ in range(n):
+        if btn1(): return 'b1'
+        if btn2(): return 'b2'
+        time.sleep(gap)
+    return None
+
+def debounce(): time.sleep(0.08)
+
+def new_frame(bg=BG_DARK):
+    img=Image.new("RGB",(WIDTH,HEIGHT),bg); return img,ImageDraw.Draw(img)
+
+def gradient(draw, top, bot):
+    for y in range(HEIGHT):
+        t=y/HEIGHT; c=tuple(int(top[i]+(bot[i]-top[i])*t) for i in range(3))
+        draw.line([(0,y),(WIDTH,y)],fill=c)
+
+# ══════════════════════════════════════════════════════════════
+# RATING
+# ══════════════════════════════════════════════════════════════
+
+def rating(ms):
+    if ms<GREAT_MS: return "GREAT!",   MINT
+    if ms<GOOD_MS:  return "Good",     GOLD
+    if ms<OK_MS:    return "OK",       PURPLE_LIGHT
+    return "Too slow",                  RED
+
+# ══════════════════════════════════════════════════════════════
+# SCREENS
+# ══════════════════════════════════════════════════════════════
+
+def screen_menu(spi, frame):
+    img,draw=new_frame()
+    gradient(draw, BG_DARK, BG_MID)
+    draw.rectangle([0,0,WIDTH,50],fill=PURPLE_DEEP)
+    draw.line([(0,50),(WIDTH,50)],fill=GOLD,width=2)
+    draw.text((WIDTH//2,15),"REACTION", fill=GOLD,        font=font(18),anchor="mm")
+    draw.text((WIDTH//2,34),"TEST",     fill=PURPLE_LIGHT,font=font(10),anchor="mm")
+    # Animated lightning bolt
+    pulse=int(6*abs(math.sin(frame*0.08)))
+    pts=[(120,88-pulse),(100,138),(118,138),(108,183+pulse),(140,126),(122,126)]
+    draw.polygon(pts,fill=GOLD)
+    draw.text((WIDTH//2,205),f"{ROUNDS} rounds",      fill=WHITE,        font=font(13),anchor="mm")
+    draw.text((WIDTH//2,228),"Wait for gold flash",   fill=PURPLE_LIGHT, font=font(11),anchor="mm")
+    draw.text((WIDTH//2,248),"then press B1 fast!",   fill=PURPLE_LIGHT, font=font(11),anchor="mm")
+    draw.text((WIDTH//2,272),"Press early = retry",   fill=PINK_HOT,     font=font(10),anchor="mm")
+    draw.text((WIDTH//2,308),"B1 = Start  B2 = Quit", fill=MINT,         font=font(10),anchor="mm")
+    show(spi, img)
+
+def screen_waiting(spi, rnd):
+    """Dark screen shown before flash — player must NOT press yet."""
+    img,draw=new_frame(BG_DARK)
+    draw.text((WIDTH//2, 40),f"Round {rnd}/{ROUNDS}",fill=PURPLE_MID,   font=font(12),anchor="mm")
+    draw.text((WIDTH//2,155),"Wait...",              fill=PURPLE_LIGHT,  font=font(20),anchor="mm")
+    draw.text((WIDTH//2,195),"Don't press yet!",     fill=PURPLE_MID,    font=font(10),anchor="mm")
+    show(spi, img)
+
+def screen_flash(spi, rnd):
+    """
+    Gold flash = press NOW.
+    Returns the timestamp AFTER show() completes so the SPI push time
+    (~80ms) is NOT counted as part of the player's reaction time.
+    """
+    img,draw=new_frame(GOLD)
+    draw.text((WIDTH//2,130),"PRESS!",               fill=BG_DARK,font=font(34),anchor="mm")
+    draw.text((WIDTH//2,175),f"Round {rnd}/{ROUNDS}",fill=BG_MID, font=font(12),anchor="mm")
+    show(spi, img)
+    return time.time()   # ← captured AFTER frame is on screen
+
+def screen_early(spi):
+    img,draw=new_frame(RED)
+    draw.text((WIDTH//2,120),"TOO",  fill=WHITE,font=font(30),anchor="mm")
+    draw.text((WIDTH//2,158),"EARLY",fill=WHITE,font=font(30),anchor="mm")
+    draw.text((WIDTH//2,210),"Wait for the flash!",fill=WHITE,font=font(11),anchor="mm")
+    show(spi, img)
+    time.sleep(1.5)
+
+def screen_result(spi, rnd, ms, label, color):
+    img,draw=new_frame()
+    gradient(draw, BG_DARK, BG_MID)
+    draw.text((WIDTH//2,50),f"Round {rnd}/{ROUNDS}",fill=PURPLE_LIGHT,font=font(12),anchor="mm")
+    draw.rounded_rectangle([25,78,215,200],14,fill=PURPLE_DEEP,outline=color,width=2)
+    draw.text((WIDTH//2,114),f"{ms} ms",fill=WHITE, font=font(28),anchor="mm")
+    draw.text((WIDTH//2,154),label,     fill=color, font=font(18),anchor="mm")
+    # Speed bar (600ms scale)
+    bw=min(180,int(ms/600*180))
+    draw.rounded_rectangle([30,216,210,232],5,fill=BG_DARK,outline=PURPLE_MID,width=1)
+    if bw>0: draw.rounded_rectangle([30,216,30+bw,232],5,fill=color)
+    draw.text((WIDTH//2,252),"Press B1 to continue",fill=PURPLE_LIGHT,font=font(10),anchor="mm")
+    show(spi, img)
+
+def screen_summary(spi, times):
+    avg  = int(sum(times)/len(times))
+    best = min(times); worst=max(times)
+    label,color=rating(avg)
+    img,draw=new_frame()
+    gradient(draw, BG_DARK, BG_MID)
+    draw.rectangle([0,0,WIDTH,50],fill=PURPLE_DEEP)
+    draw.line([(0,50),(WIDTH,50)],fill=GOLD,width=2)
+    draw.text((WIDTH//2,15),"RESULTS", fill=GOLD,        font=font(18),anchor="mm")
+    draw.text((WIDTH//2,34),"summary", fill=PURPLE_LIGHT,font=font(10),anchor="mm")
+    draw.rounded_rectangle([15,58,225,178],12,fill=PURPLE_DEEP,outline=color,width=2)
+    draw.text((WIDTH//2, 80),"Average",   fill=PURPLE_LIGHT,font=font(10),anchor="mm")
+    draw.text((WIDTH//2,108),f"{avg} ms", fill=WHITE,       font=font(26),anchor="mm")
+    draw.text((WIDTH//2,140),label,       fill=color,        font=font(16),anchor="mm")
+    draw.text((WIDTH//2,162),f"Best {best}ms  Worst {worst}ms",
+              fill=PURPLE_LIGHT,font=font(9),anchor="mm")
+    # Per-round bar chart
+    draw.text((WIDTH//2,186),"Per round:",fill=PURPLE_LIGHT,font=font(9),anchor="mm")
+    bmax=max(times)
+    for i,t in enumerate(times):
+        bx=20+i*44; bh=int(t/bmax*30); by=222+30-bh
+        _,bc=rating(t)
+        draw.rectangle([bx,by,bx+34,252],fill=bc)
+        draw.text((bx+17,260),str(i+1),fill=PURPLE_LIGHT,font=font(9),anchor="mm")
+    draw.text((WIDTH//2,280),"B1 = Again  B2 = Quit",fill=PURPLE_LIGHT,font=font(9),anchor="mm")
+    show(spi, img)
+
+# ══════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════
+
+def main():
+    spi=init_hw(); init_display(spi)
+    try:
+        while True:
+            # ── menu ──────────────────────────────────────────
+            frame=0
+            while True:
+                screen_menu(spi,frame); frame+=1
+                p=poll()
+                if p=='b1': debounce(); break
+                if p=='b2': return
+                time.sleep(0.02)
+
+            # ── rounds ────────────────────────────────────────
+            times=[]; rnd=1
+            while rnd<=ROUNDS:
+                delay=random.uniform(MIN_WAIT,MAX_WAIT)
+                screen_waiting(spi, rnd)
+                t0=time.time(); early=False
+
+                # Wait loop — any B1 press here = too early
+                while time.time()-t0 < delay:
+                    if btn1(): early=True; break
+                    time.sleep(0.008)
+
+                if early:
+                    screen_early(spi)
+                    continue       # same round, rnd not incremented
+
+                # Flash — timestamp returned AFTER frame is visible
+                flash_t = screen_flash(spi, rnd)
+
+                # Tight poll — no sleep for maximum precision
+                pressed=False
+                deadline=flash_t+3.0
+                while time.time()<deadline:
+                    if btn1():
+                        ms=int((time.time()-flash_t)*1000)
+                        pressed=True; break
+
+                if not pressed: ms=3000
+
+                debounce()
+                label,color=rating(ms)
+                times.append(ms)
+                screen_result(spi, rnd, ms, label, color)
+
+                # Wait for B1 to continue to next round
+                while True:
+                    p=poll(5,0.02)
+                    if p=='b1': debounce(); break
+                    time.sleep(0.03)
+                rnd+=1
+
+            # ── summary ───────────────────────────────────────
+            screen_summary(spi, times)
+            while True:
+                p=poll(5,0.02)
+                if p=='b1': debounce(); break   # play again
+                if p=='b2': return              # quit
+                time.sleep(0.03)
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        cleanup(spi)
+        print("Done.")
+
+if __name__=="__main__":
+    main()

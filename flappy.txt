@@ -1,0 +1,315 @@
+"""
+Flappy Bird — standalone test
+B1 (GPIO5) = Flap
+B2 (GPIO6) = Back to menu / quit
+"""
+import spidev, RPi.GPIO as GPIO
+from PIL import Image, ImageDraw, ImageFont
+import time, math, random
+
+DC, RST, CS   = 24, 25, 8
+WIDTH, HEIGHT = 240, 320
+BTN1, BTN2    = 5, 6
+
+# ── Colours ────────────────────────────────────────────────────
+BG_DARK     = (18,  12,  35)
+BG_MID      = (32,  20,  58)
+PURPLE_DEEP = (88,  44, 130)
+PURPLE_MID  = (140, 82, 200)
+PURPLE_LIGHT= (196, 154, 240)
+PINK_HOT    = (255,  80, 160)
+MINT        = (100, 230, 180)
+GOLD        = (255, 210,  80)
+WHITE       = (255, 255, 255)
+SKY_TOP     = (30,  60, 120)
+SKY_BOT     = (60, 130, 200)
+GRASS       = (60, 180,  80)
+PIPE_GREEN  = (50, 160,  60)
+PIPE_DARK   = (30, 100,  40)
+BIRD_YELLOW = (255, 210,  50)
+BIRD_ORANGE = (255, 140,  30)
+
+# ── Physics ────────────────────────────────────────────────────
+# Tuned for ~12 fps (SPI push takes ~80ms per frame)
+GRAVITY      = 0.28   # downward acceleration per frame
+FLAP_VEL     = -4.5   # upward velocity on press  (negative = up in PIL coords)
+MAX_FALL     = 5.0    # terminal fall velocity
+BIRD_X       = 55
+BIRD_R       = 12
+GROUND_H     = 38
+PIPE_W       = 36
+BASE_SPEED   = 2.0
+BASE_GAP     = 100    # vertical gap between pipes
+MIN_GAP      = 65
+SPD_PER_PIPE = 0.07   # speed increase per pipe cleared
+GAP_PER_PIPE = 0.9    # gap shrink per pipe cleared
+
+# ══════════════════════════════════════════════════════════════
+# HARDWARE
+# ══════════════════════════════════════════════════════════════
+
+def init_hw():
+    GPIO.setmode(GPIO.BCM)
+    for p in (DC, RST, CS): GPIO.setup(p, GPIO.OUT)
+    for p in (BTN1, BTN2):  GPIO.setup(p, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    spi = spidev.SpiDev(); spi.open(0, 0)
+    spi.max_speed_hz = 16_000_000; spi.mode = 0
+    return spi
+
+def cleanup(spi):
+    try: GPIO.cleanup()
+    except: pass
+    try: spi.close()
+    except: pass
+
+def _cmd(spi, c):
+    GPIO.output(CS,0); GPIO.output(DC,0); spi.writebytes([c]); GPIO.output(CS,1)
+
+def _data(spi, d):
+    GPIO.output(CS,0); GPIO.output(DC,1); spi.writebytes([d]); GPIO.output(CS,1)
+
+def init_display(spi):
+    GPIO.output(RST,0); time.sleep(0.1)
+    GPIO.output(RST,1); time.sleep(0.2)
+    _cmd(spi,0x01); time.sleep(0.2)
+    _cmd(spi,0x11); time.sleep(0.12)
+    _cmd(spi,0x3A); _data(spi,0x55)
+    _cmd(spi,0x36); _data(spi,0xC8)
+    _cmd(spi,0x29)
+
+def show(spi, img):
+    img = img.convert("RGB"); px = list(img.getdata())
+    _cmd(spi,0x2A)
+    for b in (0x00,0x00,0x00,0xEF): _data(spi,b)
+    _cmd(spi,0x2B)
+    for b in (0x00,0x00,0x01,0x3F): _data(spi,b)
+    _cmd(spi,0x2C)
+    GPIO.output(CS,0); GPIO.output(DC,1)
+    buf=[]
+    for r,g,b in px:
+        c=((r&0xF8)<<8)|((g&0xFC)<<3)|(b>>3)
+        buf+=[(c>>8)&0xFF,c&0xFF]
+        if len(buf)>=4096: spi.writebytes2(buf); buf=[]
+    if buf: spi.writebytes2(buf)
+    GPIO.output(CS,1)
+
+def font(size):
+    for p in ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+              "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"]:
+        try: return ImageFont.truetype(p, size)
+        except: pass
+    return ImageFont.load_default()
+
+def btn1(): return GPIO.input(BTN1)==GPIO.LOW
+def btn2(): return GPIO.input(BTN2)==GPIO.LOW
+
+def poll(n=12, gap=0.006):
+    """Poll both buttons n times. Returns 'b1', 'b2', or None."""
+    for _ in range(n):
+        if btn1(): return 'b1'
+        if btn2(): return 'b2'
+        time.sleep(gap)
+    return None
+
+def debounce(): time.sleep(0.08)
+
+def new_frame():
+    img=Image.new("RGB",(WIDTH,HEIGHT)); return img, ImageDraw.Draw(img)
+
+def gradient(draw, top, bot):
+    for y in range(HEIGHT):
+        t=y/HEIGHT; c=tuple(int(top[i]+(bot[i]-top[i])*t) for i in range(3))
+        draw.line([(0,y),(WIDTH,y)],fill=c)
+
+# ══════════════════════════════════════════════════════════════
+# GAME LOGIC
+# ══════════════════════════════════════════════════════════════
+
+def pipe_params(score):
+    return (min(BASE_SPEED + score*SPD_PER_PIPE, 5.5),
+            max(BASE_GAP   - score*GAP_PER_PIPE, MIN_GAP))
+
+def draw_bird(draw, y, vel):
+    cx,cy = BIRD_X, int(y)
+    draw.ellipse([cx-BIRD_R,cy-BIRD_R,cx+BIRD_R,cy+BIRD_R],
+                 fill=BIRD_YELLOW, outline=BIRD_ORANGE)
+    wo=max(-6,min(6,int(vel)))           # wing tilts with velocity
+    draw.ellipse([cx-8,cy+wo-4,cx+2,cy+wo+4], fill=BIRD_ORANGE)
+    draw.ellipse([cx+4,cy-6,cx+10,cy],   fill=WHITE)
+    draw.ellipse([cx+6,cy-5,cx+9,cy-2],  fill=BG_DARK)
+    draw.polygon([(cx+BIRD_R,cy-2),(cx+BIRD_R+7,cy+1),(cx+BIRD_R,cy+4)],
+                 fill=BIRD_ORANGE)
+
+def draw_pipe(draw, px, gap_y, gap):
+    sky_bot   = HEIGHT-GROUND_H
+    top_end   = gap_y - gap//2
+    bot_start = gap_y + gap//2
+    if top_end>0:
+        draw.rectangle([px,0,px+PIPE_W,top_end-8],      fill=PIPE_GREEN)
+        draw.rectangle([px-4,top_end-8,px+PIPE_W+4,top_end], fill=PIPE_GREEN)
+        draw.rectangle([px,0,px+4,top_end],              fill=PIPE_DARK)
+    if bot_start<sky_bot:
+        draw.rectangle([px,bot_start+8,px+PIPE_W,sky_bot],       fill=PIPE_GREEN)
+        draw.rectangle([px-4,bot_start,px+PIPE_W+4,bot_start+8], fill=PIPE_GREEN)
+        draw.rectangle([px,bot_start,px+4,sky_bot],               fill=PIPE_DARK)
+
+def draw_ground(draw, scroll):
+    y=HEIGHT-GROUND_H
+    draw.rectangle([0,y,WIDTH,HEIGHT], fill=GRASS)
+    draw.rectangle([0,y,WIDTH,y+4],   fill=(40,140,50))
+    off=int(scroll)%60
+    for x in range(-60,WIDTH+60,60):
+        draw.rectangle([x-off,y+6,x-off+28,y+14], fill=(50,160,65))
+
+def collide(bird_y, pipes, gap):
+    sky_bot=HEIGHT-GROUND_H
+    # Ground and ceiling
+    if bird_y+BIRD_R>=sky_bot or bird_y-BIRD_R<=0: return True
+    # Pipes
+    for px,gy,_ in pipes:
+        if BIRD_X+BIRD_R>px and BIRD_X-BIRD_R<px+PIPE_W:
+            if bird_y-BIRD_R<gy-gap//2 or bird_y+BIRD_R>gy+gap//2:
+                return True
+    return False
+
+def score_tick(pipes):
+    added=0
+    for i,(px,gy,sc) in enumerate(pipes):
+        if not sc and px+PIPE_W<BIRD_X:
+            pipes[i]=(px,gy,True); added+=1
+    return added
+
+# ══════════════════════════════════════════════════════════════
+# SCREENS
+# ══════════════════════════════════════════════════════════════
+
+def screen_menu(spi, frame):
+    img,draw=new_frame()
+    gradient(draw, SKY_TOP, SKY_BOT)
+    draw_ground(draw, frame*2)
+    for cx,cy in [(50,60),(160,40),(100,100)]:
+        off=int(4*math.sin(frame*0.05+cx))
+        draw.ellipse([cx-20,cy-10+off,cx+20,cy+10+off], fill=(200,220,255))
+        draw.ellipse([cx-30,cy-5+off, cx+30,cy+5+off],  fill=(210,230,255))
+    draw.rectangle([18,108,222,162], fill=GOLD)
+    draw.rectangle([20,110,220,160], fill=(200,160,0))
+    draw.text((WIDTH//2,128),"FLAPPY",fill=BG_DARK,font=font(22),anchor="mm")
+    draw.text((WIDTH//2,148),"BIRD",  fill=BG_DARK,font=font(22),anchor="mm")
+    # Bird bobbing on menu — velocity=0 so wing is neutral
+    draw_bird(draw, 210+int(10*math.sin(frame*0.1)), 0)
+    draw.text((WIDTH//2,255),"B1 = Flap",         fill=WHITE,        font=font(11),anchor="mm")
+    draw.text((WIDTH//2,273),"B2 = Quit",          fill=PURPLE_LIGHT, font=font(10),anchor="mm")
+    draw.text((WIDTH//2,300),"Press B1 to start!", fill=MINT,         font=font(13),anchor="mm")
+    show(spi, img)
+
+def screen_game(spi, bird_y, vel, pipes, score, scroll, gap):
+    img,draw=new_frame()
+    gradient(draw, SKY_TOP, SKY_BOT)
+    for cx,cy in [(40,50),(150,35),(210,70)]:
+        draw.ellipse([cx-18,cy-8,cx+18,cy+8], fill=(200,220,255))
+        draw.ellipse([cx-26,cy-4,cx+26,cy+4], fill=(210,230,255))
+    for px,gy,_ in pipes:
+        if -PIPE_W<px<WIDTH: draw_pipe(draw,px,gy,gap)
+    draw_ground(draw, scroll)
+    draw_bird(draw, bird_y, vel)
+    draw.text((WIDTH//2,18),str(score),fill=WHITE,font=font(20),anchor="mm")
+    show(spi, img)
+
+def screen_dead(spi, score, best):
+    img,draw=new_frame()
+    gradient(draw, BG_DARK, BG_MID)
+    draw.text((WIDTH//2,70), "GAME",fill=PINK_HOT,font=font(28),anchor="mm")
+    draw.text((WIDTH//2,105),"OVER",fill=PINK_HOT,font=font(28),anchor="mm")
+    draw.rounded_rectangle([30,130,210,225],12,
+                            fill=PURPLE_DEEP,outline=PURPLE_MID,width=2)
+    draw.text((WIDTH//2,152),"Score",        fill=PURPLE_LIGHT,font=font(11),anchor="mm")
+    draw.text((WIDTH//2,176),str(score),     fill=WHITE,       font=font(24),anchor="mm")
+    draw.text((WIDTH//2,202),f"Best: {best}",fill=GOLD,        font=font(11),anchor="mm")
+    draw.text((WIDTH//2,252),"B1 = Play again",fill=MINT,        font=font(11),anchor="mm")
+    draw.text((WIDTH//2,272),"B2 = Quit",      fill=PURPLE_LIGHT,font=font(10),anchor="mm")
+    show(spi, img)
+
+# ══════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════
+
+def main():
+    spi=init_hw(); init_display(spi)
+    best=0
+    try:
+        while True:
+            # ── menu ──────────────────────────────────────────
+            frame=0
+            while True:
+                screen_menu(spi, frame); frame+=1
+                p=poll()
+                if p=='b1': debounce(); break
+                if p=='b2': return      # quit program
+                time.sleep(0.02)
+
+            # ── init game state ────────────────────────────────
+            bird_y   = float(HEIGHT//2)
+            bird_vel = 0.0        # zero — gravity will pull it down naturally
+            pipes    = []
+            score    = 0
+            scroll   = 0.0
+            next_pipe= 0          # spawn first pipe immediately
+
+            # ── game loop ──────────────────────────────────────
+            quit_to_menu=False
+            while True:
+                # Input phase — runs during the 80ms SPI window
+                # B1 sets velocity UPWARD (negative in PIL screen coords)
+                # B2 exits immediately to menu
+                flapped=False
+                for _ in range(12):
+                    if btn1() and not flapped:
+                        bird_vel=FLAP_VEL   # negative = upward
+                        flapped=True
+                    if btn2():
+                        quit_to_menu=True; break
+                    time.sleep(0.006)
+                if quit_to_menu: break
+
+                # Physics — per frame (not per second)
+                # GRAVITY is positive → adds to velocity → bird_y increases → moves DOWN
+                bird_vel = min(bird_vel+GRAVITY, MAX_FALL)
+                bird_y  += bird_vel   # positive bird_vel = moving downward on screen
+
+                # Pipes
+                speed,gap=pipe_params(score)
+                pipes=[(px-speed,gy,sc) for px,gy,sc in pipes]
+                pipes=[(px,gy,sc) for px,gy,sc in pipes if px>-PIPE_W-10]
+                next_pipe-=1
+                if next_pipe<=0:
+                    next_pipe=max(55,85-score)
+                    pipes.append((float(WIDTH+PIPE_W),
+                                  random.randint(80,HEIGHT-GROUND_H-80), False))
+
+                score  += score_tick(pipes)
+                scroll += speed
+
+                if collide(bird_y, pipes, gap): break
+
+                # No sleep — SPI push is the frame pacer (~80ms = ~12fps)
+                screen_game(spi, bird_y, bird_vel, pipes, score, scroll, gap)
+
+            if quit_to_menu: continue   # restart while-True → show menu
+
+            # ── death screen ────────────────────────────────────
+            best=max(best,score)
+            screen_dead(spi, score, best)
+            while True:
+                p=poll(6,0.02)
+                if p=='b1': debounce(); break   # play again
+                if p=='b2': return              # quit
+                time.sleep(0.04)
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        cleanup(spi)
+        print("Done.")
+
+if __name__=="__main__":
+    main()

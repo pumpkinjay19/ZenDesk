@@ -1,0 +1,302 @@
+"""
+Pong vs CPU — standalone test
+B1 (GPIO5) = paddle UP
+B2 (GPIO6) = paddle DOWN  (hold for continuous movement)
+First to 7 wins. CPU gets faster with every rally hit.
+"""
+import spidev, RPi.GPIO as GPIO
+from PIL import Image, ImageDraw, ImageFont
+import time, math, random
+
+DC, RST, CS   = 24, 25, 8
+WIDTH, HEIGHT = 240, 320
+BTN1, BTN2    = 5, 6
+
+BG_DARK      = (18,  12,  35)
+BG_MID       = (32,  20,  58)
+PURPLE_DEEP  = (88,  44, 130)
+PURPLE_MID   = (140, 82, 200)
+PURPLE_LIGHT = (196, 154, 240)
+PINK_HOT     = (255,  80, 160)
+MINT         = (100, 230, 180)
+GOLD         = (255, 210,  80)
+WHITE        = (255, 255, 255)
+
+# Court
+CT      = 30              # top y of play area
+CB      = HEIGHT - 4      # bottom y of play area
+CH      = CB - CT         # court height
+
+# Paddles
+PAD_W   = 10
+PAD_H   = 50
+P_X     = 8               # player paddle left edge
+C_X     = WIDTH - 8 - PAD_W   # CPU paddle left edge
+PAD_SPD = 5               # pixels per frame player moves
+
+# Ball
+BALL_SZ = 8
+BVX0    = 3.0             # starting horizontal speed
+BVY0    = 2.2             # starting vertical speed
+
+# CPU AI
+CPU_SPD0  = 2.4           # starting CPU paddle speed (px/frame)
+CPU_MAX   = 5.2           # max CPU speed
+CPU_STEP  = 0.12          # speed gain per rally hit
+
+WIN_PTS = 7
+
+# ══════════════════════════════════════════════════════════════
+# HARDWARE
+# ══════════════════════════════════════════════════════════════
+
+def init_hw():
+    GPIO.setmode(GPIO.BCM)
+    for p in (DC,RST,CS):  GPIO.setup(p, GPIO.OUT)
+    for p in (BTN1,BTN2):  GPIO.setup(p, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    spi=spidev.SpiDev(); spi.open(0,0)
+    spi.max_speed_hz=16_000_000; spi.mode=0
+    return spi
+
+def cleanup(spi):
+    try: GPIO.cleanup()
+    except: pass
+    try: spi.close()
+    except: pass
+
+def _cmd(spi,c):
+    GPIO.output(CS,0); GPIO.output(DC,0); spi.writebytes([c]); GPIO.output(CS,1)
+
+def _data(spi,d):
+    GPIO.output(CS,0); GPIO.output(DC,1); spi.writebytes([d]); GPIO.output(CS,1)
+
+def init_display(spi):
+    GPIO.output(RST,0); time.sleep(0.1)
+    GPIO.output(RST,1); time.sleep(0.2)
+    _cmd(spi,0x01); time.sleep(0.2)
+    _cmd(spi,0x11); time.sleep(0.12)
+    _cmd(spi,0x3A); _data(spi,0x55)
+    _cmd(spi,0x36); _data(spi,0xC8)
+    _cmd(spi,0x29)
+
+def show(spi, img):
+    img=img.convert("RGB"); px=list(img.getdata())
+    _cmd(spi,0x2A)
+    for b in (0x00,0x00,0x00,0xEF): _data(spi,b)
+    _cmd(spi,0x2B)
+    for b in (0x00,0x00,0x01,0x3F): _data(spi,b)
+    _cmd(spi,0x2C)
+    GPIO.output(CS,0); GPIO.output(DC,1)
+    buf=[]
+    for r,g,b in px:
+        c=((r&0xF8)<<8)|((g&0xFC)<<3)|(b>>3)
+        buf+=[(c>>8)&0xFF,c&0xFF]
+        if len(buf)>=4096: spi.writebytes2(buf); buf=[]
+    if buf: spi.writebytes2(buf)
+    GPIO.output(CS,1)
+
+def font(size):
+    for p in ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+              "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"]:
+        try: return ImageFont.truetype(p,size)
+        except: pass
+    return ImageFont.load_default()
+
+def btn1(): return GPIO.input(BTN1)==GPIO.LOW
+def btn2(): return GPIO.input(BTN2)==GPIO.LOW
+
+def poll(n=10,gap=0.010):
+    for _ in range(n):
+        if btn1(): return 'b1'
+        if btn2(): return 'b2'
+        time.sleep(gap)
+    return None
+
+def debounce(): time.sleep(0.08)
+
+def new_frame(bg=BG_DARK):
+    img=Image.new("RGB",(WIDTH,HEIGHT),bg); return img,ImageDraw.Draw(img)
+
+def gradient(draw, top, bot):
+    for y in range(HEIGHT):
+        t=y/HEIGHT; c=tuple(int(top[i]+(bot[i]-top[i])*t) for i in range(3))
+        draw.line([(0,y),(WIDTH,y)],fill=c)
+
+# ══════════════════════════════════════════════════════════════
+# GAME LOGIC
+# ══════════════════════════════════════════════════════════════
+
+def reset_ball(direction=1):
+    """direction=1 → toward CPU, direction=-1 → toward player."""
+    return (float(WIDTH//2),
+            float(random.randint(CT+40, CB-40)),
+            BVX0*direction,
+            random.choice([-1,1])*BVY0)
+
+
+def cpu_move(cy, ball_y, spd):
+    """Simple tracking AI — follows ball centre with capped speed."""
+    mid = cy + PAD_H//2
+    if   ball_y < mid-5: cy -= spd
+    elif ball_y > mid+5: cy += spd
+    return max(float(CT), min(float(CB-PAD_H), cy))
+
+# ══════════════════════════════════════════════════════════════
+# SCREENS
+# ══════════════════════════════════════════════════════════════
+
+def screen_menu(spi, frame):
+    img,draw=new_frame(BG_DARK)
+    # Animated centre dashes
+    for y in range(0,HEIGHT,20):
+        if (y//20+frame//6)%2==0:
+            draw.rectangle([WIDTH//2-1,y,WIDTH//2+1,y+12],fill=PURPLE_MID)
+    draw.text((WIDTH//2, 75),"PONG",   fill=WHITE,        font=font(32),anchor="mm")
+    draw.text((WIDTH//2,115),"vs CPU", fill=PURPLE_LIGHT, font=font(14),anchor="mm")
+    draw.rounded_rectangle([25,140,215,248],10,fill=PURPLE_DEEP,outline=PURPLE_MID,width=1)
+    for txt,col,y in [
+        ("B1 = Paddle UP",      MINT,         165),
+        ("B2 = Paddle DOWN",    PINK_HOT,     193),
+        ("First to 7 wins",     PURPLE_LIGHT, 222),
+    ]:
+        draw.text((WIDTH//2,y),txt,fill=col,font=font(11),anchor="mm")
+    draw.text((WIDTH//2,272),"Rally → CPU gets faster!",fill=PURPLE_LIGHT,font=font(9),anchor="mm")
+    draw.text((WIDTH//2,312),"Press B1 to start",       fill=MINT,        font=font(12),anchor="mm")
+    show(spi, img)
+
+def screen_game(spi, py, cy, bx, by, ps, cs, rally):
+    img,draw=new_frame(BG_DARK)
+    # Score header
+    draw.text((70, 15),str(ps),    fill=WHITE,     font=font(16),anchor="mm")
+    draw.text((WIDTH//2,15),"vs",  fill=PURPLE_MID,font=font(10),anchor="mm")
+    draw.text((170,15),str(cs),    fill=WHITE,     font=font(16),anchor="mm")
+    draw.line([(0,CT),(WIDTH,CT)], fill=PURPLE_MID,width=1)
+    # Centre dashes
+    for y in range(CT,CB,20):
+        draw.rectangle([WIDTH//2-1,y,WIDTH//2+1,y+10],fill=PURPLE_DEEP)
+    # Ball colour heats up with rally
+    bc = MINT if rally<5 else GOLD if rally<10 else PINK_HOT
+    # Player paddle (left, green)
+    draw.rounded_rectangle([P_X,int(py),P_X+PAD_W,int(py)+PAD_H],4,fill=MINT)
+    # CPU paddle (right, pink)
+    draw.rounded_rectangle([C_X,int(cy),C_X+PAD_W,int(cy)+PAD_H],4,fill=PINK_HOT)
+    # Ball
+    draw.rectangle([int(bx),int(by),int(bx)+BALL_SZ,int(by)+BALL_SZ],fill=bc)
+    # Rally heat label
+    if rally>=5:
+        draw.text((WIDTH//2,CT+14),f"Rally x{rally}!",fill=bc,font=font(9),anchor="mm")
+    show(spi, img)
+
+def screen_point(spi, who, ps, cs):
+    img,draw=new_frame()
+    gradient(draw,BG_DARK,BG_MID)
+    c=MINT if who=="player" else PINK_HOT
+    draw.text((WIDTH//2,130),"You scored!" if who=="player" else "CPU scored!",
+              fill=c,font=font(16),anchor="mm")
+    draw.text((WIDTH//2,170),f"{ps}  —  {cs}",fill=WHITE,font=font(20),anchor="mm")
+    show(spi, img)
+    time.sleep(1.0)
+
+def screen_win(spi, winner, ps, cs):
+    img,draw=new_frame()
+    gradient(draw,BG_DARK,BG_MID)
+    c=MINT if winner=="player" else PINK_HOT
+    draw.text((WIDTH//2, 80),"YOU WIN!" if winner=="player" else "CPU WINS",
+              fill=c,font=font(26),anchor="mm")
+    draw.rounded_rectangle([40,130,200,202],10,fill=PURPLE_DEEP,outline=PURPLE_MID,width=2)
+    draw.text((WIDTH//2,152),"Final score",         fill=PURPLE_LIGHT,font=font(10),anchor="mm")
+    draw.text((WIDTH//2,177),f"{ps}  —  {cs}",     fill=WHITE,       font=font(18),anchor="mm")
+    draw.text((WIDTH//2,232),"B1 = Again  B2 = Quit",fill=PURPLE_LIGHT,font=font(10),anchor="mm")
+    show(spi, img)
+
+# ══════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════
+
+def main():
+    spi=init_hw(); init_display(spi)
+    try:
+        while True:
+            # ── menu ──────────────────────────────────────────
+            frame=0
+            while True:
+                screen_menu(spi,frame); frame+=1
+                p=poll()
+                if p=='b1': debounce(); break
+                if p=='b2': return
+                time.sleep(0.02)
+
+            # ── init game state ────────────────────────────────
+            ps=cs=rally=0
+            mid=float(CT+(CH-PAD_H)//2)
+            py=cy=mid
+            bx,by,vx,vy=reset_ball(1)
+
+            # ── game loop ──────────────────────────────────────
+            while ps<WIN_PTS and cs<WIN_PTS:
+
+                # Input — tight poll so HELD buttons move paddle smoothly.
+                # Both buttons are checked every 4ms inside the SPI push window.
+                for _ in range(8):
+                    if btn1(): py=max(float(CT),       py-PAD_SPD)
+                    if btn2(): py=min(float(CB-PAD_H), py+PAD_SPD)
+                    time.sleep(0.004)
+
+                # CPU tracking
+                cpu_spd=min(CPU_SPD0+rally*CPU_STEP, CPU_MAX)
+                cy=cpu_move(cy, by+BALL_SZ//2, cpu_spd)
+
+                # Ball movement — speed scales with rally
+                sf=min(1.0+rally*0.04, 1.9)
+                bx+=vx*sf; by+=vy*sf
+
+                # Top/bottom wall bounce
+                if by<=CT:            by=float(CT);        vy=abs(vy)
+                if by+BALL_SZ>=CB:    by=float(CB-BALL_SZ);vy=-abs(vy)
+
+                # Player paddle bounce (left wall)
+                if (bx<=P_X+PAD_W and
+                        by+BALL_SZ>=py and by<=py+PAD_H and vx<0):
+                    vx=abs(vx)
+                    # Angle = where ball hit the paddle (0=top, 1=bottom)
+                    hit=((by+BALL_SZ//2)-py)/PAD_H
+                    vy=(hit-0.5)*6
+                    rally+=1
+
+                # CPU paddle bounce (right wall)
+                if (bx+BALL_SZ>=C_X and
+                        by+BALL_SZ>=cy and by<=cy+PAD_H and vx>0):
+                    vx=-abs(vx)
+                    hit=((by+BALL_SZ//2)-cy)/PAD_H
+                    vy=(hit-0.5)*6
+                    rally+=1
+
+                # Scoring
+                if bx+BALL_SZ<0:
+                    cs+=1; screen_point(spi,"cpu",ps,cs)
+                    bx,by,vx,vy=reset_ball(-1); rally=0; py=cy=mid; continue
+
+                if bx>WIDTH:
+                    ps+=1; screen_point(spi,"player",ps,cs)
+                    bx,by,vx,vy=reset_ball(1);  rally=0; py=cy=mid; continue
+
+                screen_game(spi, py, cy, bx, by, ps, cs, rally)
+                # No extra sleep — SPI push paces the loop at ~12fps
+
+            # ── win screen ─────────────────────────────────────
+            winner="player" if ps>=WIN_PTS else "cpu"
+            screen_win(spi, winner, ps, cs)
+            while True:
+                p=poll(5,0.02)
+                if p=='b1': debounce(); break   # play again
+                if p=='b2': return              # quit
+                time.sleep(0.04)
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        cleanup(spi)
+        print("Done.")
+
+if __name__=="__main__":
+    main()

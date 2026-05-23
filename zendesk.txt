@@ -1,0 +1,692 @@
+import spidev
+import RPi.GPIO as GPIO
+from smbus2 import SMBus
+from PIL import Image, ImageDraw, ImageFont
+import time
+import math
+
+# Display pins
+DC, RST, CS = 24, 25, 8
+WIDTH, HEIGHT = 240, 320
+
+# Color palette
+BG_DARK      = (18,  12,  35)
+BG_MID       = (32,  20,  58)
+PURPLE_DEEP  = (88,  44, 130)
+PURPLE_MID   = (140, 82, 200)
+PURPLE_LIGHT = (196, 154, 240)
+PINK_HOT     = (255,  80, 160)
+PINK_SOFT    = (255, 160, 210)
+MINT         = (100, 230, 180)
+GOLD         = (255, 210,  80)
+WHITE        = (255, 255, 255)
+OFF_WHITE    = (240, 230, 255)
+
+# GPIO + SPI
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(DC,  GPIO.OUT)
+GPIO.setup(RST, GPIO.OUT)
+GPIO.setup(CS,  GPIO.OUT)
+
+spi = spidev.SpiDev()
+spi.open(0, 0)
+spi.max_speed_hz = 16000000
+spi.mode = 0
+
+bus  = SMBus(1)
+addr = 0x57
+
+# ── Display driver ─────────────────────────────────────────────
+def cmd(c):
+    GPIO.output(CS, GPIO.LOW)
+    GPIO.output(DC, GPIO.LOW)
+    spi.writebytes([c])
+    GPIO.output(CS, GPIO.HIGH)
+
+def data(d):
+    GPIO.output(CS, GPIO.LOW)
+    GPIO.output(DC, GPIO.HIGH)
+    spi.writebytes([d])
+    GPIO.output(CS, GPIO.HIGH)
+
+def init_display():
+    GPIO.output(RST, GPIO.LOW);  time.sleep(0.1)
+    GPIO.output(RST, GPIO.HIGH); time.sleep(0.2)
+    cmd(0x01); time.sleep(0.2)
+    cmd(0x11); time.sleep(0.12)
+    cmd(0x3A); data(0x55)
+    cmd(0x36); data(0xC8)
+    cmd(0x29)
+
+def show_image(img):
+    img = img.convert("RGB")
+    pixels = list(img.getdata())
+    cmd(0x2A)
+    data(0x00); data(0x00); data(0x00); data(0xEF)
+    cmd(0x2B)
+    data(0x00); data(0x00); data(0x01); data(0x3F)
+    cmd(0x2C)
+    GPIO.output(CS, GPIO.LOW)
+    GPIO.output(DC, GPIO.HIGH)
+    buf = []
+    for r, g, b in pixels:
+        c565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+        buf.append((c565 >> 8) & 0xFF)
+        buf.append(c565 & 0xFF)
+        if len(buf) >= 4096:
+            spi.writebytes2(buf)
+            buf = []
+    if buf:
+        spi.writebytes2(buf)
+    GPIO.output(CS, GPIO.HIGH)
+
+# ── Sensor ─────────────────────────────────────────────────────
+def init_sensor():
+    bus.write_byte_data(addr, 0x09, 0x40)
+    time.sleep(0.1)
+    bus.write_byte_data(addr, 0x04, 0x00)
+    bus.write_byte_data(addr, 0x05, 0x00)
+    bus.write_byte_data(addr, 0x06, 0x00)
+    bus.write_byte_data(addr, 0x08, 0x4F)
+    bus.write_byte_data(addr, 0x09, 0x03)
+    bus.write_byte_data(addr, 0x0A, 0x27)
+    bus.write_byte_data(addr, 0x0C, 0xFF)
+    bus.write_byte_data(addr, 0x0D, 0xFF)
+    time.sleep(0.1)
+    print("Sensor initialised")
+
+def flush_fifo():
+    bus.write_byte_data(addr, 0x04, 0x00)
+    bus.write_byte_data(addr, 0x05, 0x00)
+    bus.write_byte_data(addr, 0x06, 0x00)
+
+def read_one_sample():
+    wr_ptr = bus.read_byte_data(addr, 0x04) & 0x1F
+    rd_ptr = bus.read_byte_data(addr, 0x06) & 0x1F
+    n = (wr_ptr - rd_ptr) & 0x1F
+    if n == 0:
+        return None
+    raw = bus.read_i2c_block_data(addr, 0x07, 6)
+    red = (raw[0] << 16 | raw[1] << 8 | raw[2]) & 0x3FFFF
+    ir  = (raw[3] << 16 | raw[4] << 8 | raw[5]) & 0x3FFFF
+    return red, ir
+
+def check_finger():
+    """Check multiple samples to confirm finger presence."""
+    for _ in range(8):
+        s = read_one_sample()
+        if s is not None and s[1] > 50000:
+            return True
+        time.sleep(0.01)
+    return False
+
+def collect_samples(n_samples=100, update_cb=None):
+    flush_fifo()
+    time.sleep(0.05)
+    reds, irs = [], []
+    for i in range(n_samples):
+        t0 = time.time()
+        sample = None
+        deadline = t0 + 0.08
+        while time.time() < deadline:
+            sample = read_one_sample()
+            if sample is not None:
+                break
+            time.sleep(0.005)
+        if sample is None:
+            continue
+        red, ir = sample
+        if ir < 30000:
+            print(f"Finger removed at sample {i}")
+            return None, None
+        reds.append(red)
+        irs.append(ir)
+        if update_cb:
+            update_cb(reds, irs, i / n_samples)
+        elapsed = time.time() - t0
+        time.sleep(max(0, 0.04 - elapsed))
+    return reds, irs
+
+# ── Signal processing ──────────────────────────────────────────
+def bandpass_simple(signal, window=5):
+    if len(signal) < window * 2:
+        return signal
+    dc = []
+    for i in range(len(signal)):
+        lo = max(0, i - window)
+        hi = min(len(signal), i + window + 1)
+        dc.append(sum(signal[lo:hi]) / (hi - lo))
+    return [signal[i] - dc[i] for i in range(len(signal))]
+
+def detect_peaks(signal, min_distance=10, threshold_ratio=0.4):
+    if len(signal) < 4:
+        return []
+    mn, mx = min(signal), max(signal)
+    threshold = mn + (mx - mn) * threshold_ratio
+    peaks = []
+    last_peak = -min_distance
+    for i in range(1, len(signal) - 1):
+        if (signal[i] > threshold and
+            signal[i] > signal[i-1] and
+            signal[i] > signal[i+1] and
+            i - last_peak >= min_distance):
+            peaks.append(i)
+            last_peak = i
+    return peaks
+
+def calculate_hr(ir_signal, sample_rate=25):
+    if len(ir_signal) < 20:
+        return 72
+    ac = bandpass_simple(ir_signal, window=6)
+    peaks = detect_peaks(ac, min_distance=10, threshold_ratio=0.35)
+    if len(peaks) < 2:
+        peaks = detect_peaks(ac, min_distance=8, threshold_ratio=0.2)
+    if len(peaks) >= 2:
+        intervals = [peaks[i+1] - peaks[i] for i in range(len(peaks)-1)]
+        avg_interval = sum(intervals) / len(intervals)
+        hr = int(60 / (avg_interval / sample_rate))
+        return max(45, min(150, hr))
+    return 72
+
+def calculate_spo2(red_signal, ir_signal):
+    if len(red_signal) < 10 or len(ir_signal) < 10:
+        return 98
+    def ac_dc(sig):
+        mn, mx = min(sig), max(sig)
+        dc = sum(sig) / len(sig)
+        ac = (mx - mn) / 2.0
+        return ac, dc
+    ac_r, dc_r   = ac_dc(red_signal)
+    ac_ir, dc_ir = ac_dc(ir_signal)
+    if dc_r < 1 or dc_ir < 1 or ac_ir < 1:
+        return 98
+    R = (ac_r / dc_r) / (ac_ir / dc_ir)
+    return max(85, min(100, int(110 - 25 * R)))
+
+def get_mood(hr):
+    if hr < 60:   return "sleepy"
+    elif hr < 75: return "calm"
+    elif hr < 95: return "happy"
+    else:         return "excited"
+
+# ── Font helper ────────────────────────────────────────────────
+def font(size):
+    for path in [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    ]:
+        try:
+            return ImageFont.truetype(path, size)
+        except:
+            pass
+    return ImageFont.load_default()
+
+# ── Drawing helpers ────────────────────────────────────────────
+def fill_gradient(draw, y1, y2, color_top, color_bot):
+    for y in range(y1, y2):
+        t = (y - y1) / max(1, y2 - y1)
+        r = int(color_top[0] + (color_bot[0]-color_top[0]) * t)
+        g = int(color_top[1] + (color_bot[1]-color_top[1]) * t)
+        b = int(color_top[2] + (color_bot[2]-color_top[2]) * t)
+        draw.line([(0,y),(WIDTH,y)], fill=(r,g,b))
+
+def rrect(draw, x1, y1, x2, y2, r=10, fill=None, outline=None, width=1):
+    draw.rounded_rectangle([(x1,y1),(x2,y2)], radius=r,
+                            fill=fill, outline=outline, width=width)
+
+def glow_circle(draw, cx, cy, r, color, layers=3):
+    for i in range(layers, 0, -1):
+        cr = min(255, color[0]+30)
+        cg = min(255, color[1]+30)
+        cb = min(255, color[2]+30)
+        draw.ellipse([cx-r-i*3, cy-r-i*3, cx+r+i*3, cy+r+i*3],
+                     outline=(cr, cg, cb), width=1)
+    draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=color)
+
+def draw_sparkle(draw, x, y, size, color):
+    draw.polygon([(x,y-size),(x+size//3,y),(x,y+size),(x-size//3,y)], fill=color)
+    draw.polygon([(x-size,y),(x,y-size//3),(x+size,y),(x,y+size//3)], fill=color)
+
+def draw_face(draw, mood, cx, cy, blink=False, frame=0):
+    pulse = int(4 * math.sin(frame * 0.15))
+    draw.ellipse([cx-58-pulse, cy-58-pulse, cx+58+pulse, cy+58+pulse],
+                 outline=PURPLE_LIGHT, width=1)
+    draw.ellipse([cx-55-pulse//2, cy-55-pulse//2,
+                  cx+55+pulse//2, cy+55+pulse//2],
+                 outline=PINK_SOFT, width=1)
+    draw.ellipse([cx-52, cy-52, cx+52, cy+52],
+                 fill=BG_MID, outline=PURPLE_MID, width=2)
+
+    lx, rx = cx-22, cx+22
+    ey = cy - 16
+
+    if mood == "excited":
+        if not blink:
+            draw_sparkle(draw, lx, ey, 12, PINK_HOT)
+            draw_sparkle(draw, rx, ey, 12, PINK_HOT)
+        else:
+            draw.line([lx-13,ey,lx+13,ey], fill=PINK_HOT, width=3)
+            draw.line([rx-13,ey,rx+13,ey], fill=PINK_HOT, width=3)
+        draw.arc([cx-28, cy+8, cx+28, cy+36], start=0, end=180, fill=PINK_HOT, width=5)
+        draw.ellipse([cx-54, cy+2, cx-32, cy+20], fill=(200, 100, 150))
+        draw.ellipse([cx+32, cy+2, cx+54, cy+20], fill=(200, 100, 150))
+
+    elif mood == "happy":
+        if not blink:
+            draw.arc([lx-13, ey-11, lx+13, ey+11], start=180, end=360, fill=MINT, width=4)
+            draw.arc([rx-13, ey-11, rx+13, ey+11], start=180, end=360, fill=MINT, width=4)
+            draw.ellipse([lx+3, ey-8, lx+8, ey-3], fill=WHITE)
+            draw.ellipse([rx+3, ey-8, rx+8, ey-3], fill=WHITE)
+        else:
+            draw.line([lx-13,ey,lx+13,ey], fill=MINT, width=3)
+            draw.line([rx-13,ey,rx+13,ey], fill=MINT, width=3)
+        draw.arc([cx-25, cy+8, cx+25, cy+32], start=0, end=180, fill=MINT, width=4)
+        draw.ellipse([cx-52, cy+3, cx-33, cy+18], fill=PINK_SOFT)
+        draw.ellipse([cx+33, cy+3, cx+52, cy+18], fill=PINK_SOFT)
+
+    elif mood == "sleepy":
+        draw.ellipse([lx-13,ey-10, lx+13,ey+10], fill=PURPLE_LIGHT)
+        draw.rectangle([lx-14,ey-11, lx+14,ey+2], fill=BG_MID)
+        draw.ellipse([rx-13,ey-10, rx+13,ey+10], fill=PURPLE_LIGHT)
+        draw.rectangle([rx-14,ey-11, rx+14,ey+2], fill=BG_MID)
+        draw.arc([cx-14, cy+12, cx+14, cy+26], start=0, end=180, fill=PURPLE_LIGHT, width=3)
+        f_z = font(13)
+        draw.text((cx+36, cy-52), "z",  fill=PURPLE_MID,   font=f_z)
+        draw.text((cx+50, cy-68), "Z",  fill=PURPLE_LIGHT, font=f_z)
+        draw.text((cx+64, cy-85), "Z",  fill=PINK_SOFT,    font=f_z)
+
+    else:  # calm
+        if not blink:
+            glow_circle(draw, lx, ey, 12, PURPLE_MID, layers=2)
+            draw.ellipse([lx-5, ey-5, lx+5, ey+5], fill=WHITE)
+            glow_circle(draw, rx, ey, 12, PURPLE_MID, layers=2)
+            draw.ellipse([rx-5, ey-5, rx+5, ey+5], fill=WHITE)
+        else:
+            draw.line([lx-13,ey,lx+13,ey], fill=PURPLE_LIGHT, width=4)
+            draw.line([rx-13,ey,rx+13,ey], fill=PURPLE_LIGHT, width=4)
+        draw.arc([cx-18, cy+10, cx+18, cy+28], start=0, end=180, fill=PURPLE_LIGHT, width=3)
+
+def draw_pulse_wave(draw, ir_signal, x0, y0, w, h, color=MINT):
+    rrect(draw, x0-2, y0-2, x0+w+2, y0+h+2, 6, fill=BG_DARK, outline=PURPLE_MID, width=1)
+    if len(ir_signal) < 4:
+        draw.line([(x0, y0+h//2),(x0+w, y0+h//2)], fill=PURPLE_MID, width=1)
+        return
+    ac = bandpass_simple(ir_signal, window=8)
+    display = ac[-60:] if len(ac) > 60 else ac
+    mn, mx = min(display), max(display)
+    rng = mx - mn
+    if rng < 10:
+        draw.line([(x0, y0+h//2),(x0+w, y0+h//2)], fill=PURPLE_MID, width=1)
+        draw.text((x0+w//2, y0+h//2-8), "Keep still...",
+                  fill=PURPLE_LIGHT, font=font(9), anchor="mm")
+        return
+    n = len(display)
+    pts = []
+    for i, v in enumerate(display):
+        px = x0 + int(i * w / max(1, n-1))
+        py = y0 + h - int((v - mn) / rng * (h - 4)) - 2
+        py = max(y0+1, min(y0+h-1, py))
+        pts.append((px, py))
+    for i in range(len(pts)-1):
+        draw.line([pts[i], pts[i+1]], fill=(color[0]//3, color[1]//3, color[2]//3), width=4)
+    for i in range(len(pts)-1):
+        draw.line([pts[i], pts[i+1]], fill=color, width=2)
+    peaks = detect_peaks(display, min_distance=8, threshold_ratio=0.35)
+    for p in peaks:
+        if 0 < p < n:
+            draw.ellipse([pts[p][0]-3, pts[p][1]-3,
+                          pts[p][0]+3, pts[p][1]+3], fill=PINK_HOT)
+
+# ── Screen 1: Place finger ─────────────────────────────────────
+def screen_place_finger(frame=0):
+    img  = Image.new("RGB", (WIDTH, HEIGHT), BG_DARK)
+    draw = ImageDraw.Draw(img)
+    fill_gradient(draw, 0, HEIGHT, BG_DARK, BG_MID)
+
+    rrect(draw, 0, 0, WIDTH, 52, 0, fill=PURPLE_DEEP)
+    draw.line([(0,52),(WIDTH,52)], fill=PINK_HOT, width=2)
+    draw.text((WIDTH//2, 15), "ZEN DESK", fill=PINK_HOT, font=font(18), anchor="mm")
+    draw.text((WIDTH//2, 36), "heart rate monitor", fill=PURPLE_LIGHT, font=font(10), anchor="mm")
+
+    cx, cy = 120, 185
+    pulse = int(12 * abs(math.sin(frame * 0.12)))
+    for r, c in [(70+pulse, PURPLE_DEEP), (60, BG_MID), (50, PURPLE_DEEP), (40, PURPLE_MID)]:
+        draw.ellipse([cx-r,cy-r,cx+r,cy+r], outline=c, width=1)
+
+    draw.ellipse([cx-38,cy-38,cx+38,cy+38], fill=PURPLE_MID)
+    draw.rounded_rectangle([(cx-13,cy-28),(cx+13,cy+24)], radius=10, fill=PINK_SOFT)
+    draw.rounded_rectangle([(cx-9,cy-28),(cx+9,cy-16)], radius=5, fill=OFF_WHITE)
+
+    hy = cy + 48
+    pts_hb = []
+    for i in range(50):
+        x = cx - 45 + i * 2
+        if 18 <= i <= 22:
+            y = hy - int(20 * math.sin((i-18)/4 * math.pi))
+        elif 22 <= i <= 26:
+            y = hy + int(10 * math.sin((i-22)/4 * math.pi))
+        else:
+            y = hy
+        pts_hb.append((x, y))
+    for i in range(len(pts_hb)-1):
+        draw.line([pts_hb[i], pts_hb[i+1]], fill=MINT, width=2)
+
+    draw.text((WIDTH//2, 258), "Place your finger", fill=PURPLE_LIGHT, font=font(12), anchor="mm")
+    draw.text((WIDTH//2, 276), "on the sensor", fill=PURPLE_LIGHT, font=font(12), anchor="mm")
+    draw.line([(30,292),(210,292)], fill=PURPLE_MID, width=1)
+    draw.text((WIDTH//2, 305), "keep still for best results", fill=PURPLE_MID, font=font(9), anchor="mm")
+    draw.text((WIDTH//2, 317), "sensor detects IR + RED light", fill=PURPLE_MID, font=font(9), anchor="mm")
+
+    dots = "waiting for contact" + "." * (int(frame * 0.1) % 4)
+    rrect(draw, 10, 326, 230, 342, 5, fill=PURPLE_DEEP)
+    draw.text((WIDTH//2, 334), dots, fill=MINT, font=font(9), anchor="mm")
+
+    return img
+
+# ── Screen 2: Measuring ────────────────────────────────────────
+def screen_measuring(sec, all_reds, all_irs, frame=0):
+    img  = Image.new("RGB", (WIDTH, HEIGHT), BG_DARK)
+    draw = ImageDraw.Draw(img)
+    fill_gradient(draw, 0, HEIGHT, BG_DARK, BG_MID)
+
+    rrect(draw, 0, 0, WIDTH, 52, 0, fill=PURPLE_DEEP)
+    draw.line([(0,52),(WIDTH,52)], fill=MINT, width=2)
+    draw.text((WIDTH//2, 15), "ZEN DESK", fill=MINT, font=font(18), anchor="mm")
+    draw.text((WIDTH//2, 36), "measuring...", fill=PURPLE_LIGHT, font=font(10), anchor="mm")
+
+    # Countdown circle
+    cx, cy = 120, 115
+    angle = int((1 - sec/10) * 360)
+    draw.ellipse([cx-45, cy-45, cx+45, cy+45], outline=PURPLE_MID, width=4)
+    if angle > 0:
+        draw.arc([cx-45, cy-45, cx+45, cy+45], start=-90, end=-90+angle, fill=MINT, width=4)
+    draw.text((cx, cy), str(sec), fill=WHITE, font=font(28), anchor="mm")
+    draw.text((cx, cy+22), "sec", fill=PURPLE_LIGHT, font=font(10), anchor="mm")
+
+    # Progress bar
+    progress = int((10 - sec) / 10 * 200)
+    rrect(draw, 20, 168, 220, 182, 5, fill=PURPLE_DEEP)
+    if progress > 0:
+        rrect(draw, 20, 168, 20+progress, 182, 5, fill=MINT)
+
+    # Live pulse wave
+    draw.text((12, 192), "live signal", fill=PURPLE_LIGHT, font=font(9))
+    draw_pulse_wave(draw, all_irs, 10, 205, 220, 55, color=MINT)
+
+    # Live HR estimate
+    if len(all_irs) > 20:
+        live_hr = calculate_hr(all_irs)
+        draw.text((WIDTH//2, 272), f"~{live_hr} BPM", fill=PINK_HOT, font=font(14), anchor="mm")
+    else:
+        draw.text((WIDTH//2, 272), "calibrating...", fill=PURPLE_MID, font=font(11), anchor="mm")
+
+    draw.text((WIDTH//2, 292), "keep finger on sensor", fill=PURPLE_MID, font=font(9), anchor="mm")
+
+    # Animated dots
+    for i, (sx, sy) in enumerate([(30,310),(120,308),(210,310)]):
+        s = int(3 + 2 * math.sin(frame * 0.2 + i * 1.2))
+        c = [PINK_HOT, MINT, PURPLE_LIGHT][i]
+        draw.ellipse([sx-s,sy-s,sx+s,sy+s], fill=c)
+
+    return img
+
+# ── Screen 3: Vitals results ───────────────────────────────────
+def screen_vitals(hr, spo2, mood, all_irs, blink=False, frame=0):
+    img  = Image.new("RGB", (WIDTH, HEIGHT), BG_DARK)
+    draw = ImageDraw.Draw(img)
+    fill_gradient(draw, 0, HEIGHT, BG_DARK, BG_MID)
+
+    rrect(draw, 0, 0, WIDTH, 52, 0, fill=PURPLE_DEEP)
+    draw.line([(0,52),(WIDTH,52)], fill=PINK_HOT, width=2)
+    draw.text((WIDTH//2, 15), "ZEN DESK", fill=PINK_HOT, font=font(18), anchor="mm")
+    draw.text((WIDTH//2, 36), "your results", fill=PURPLE_LIGHT, font=font(10), anchor="mm")
+
+    # Face
+    draw_face(draw, mood, 120, 118, blink=blink, frame=frame)
+
+    mood_labels = {"calm": "Calm ~", "happy": "Happy!", "excited": "Excited!!", "sleepy": "Sleepy~"}
+    mood_colors = {"calm": PURPLE_LIGHT, "happy": MINT, "excited": PINK_HOT, "sleepy": PURPLE_MID}
+    draw.text((WIDTH//2, 178), mood_labels.get(mood, ""), fill=mood_colors.get(mood, WHITE),
+              font=font(12), anchor="mm")
+
+    draw.line([(20,190),(220,190)], fill=PURPLE_MID, width=1)
+
+    # HR + SpO2 side by side
+    rrect(draw, 8, 196, 116, 238, 8, fill=PURPLE_DEEP, outline=PINK_HOT, width=1)
+    draw.text((62, 206), "HEART RATE", fill=PINK_HOT, font=font(8), anchor="mm")
+    draw.text((62, 224), f"{hr}", fill=WHITE, font=font(16), anchor="mm")
+    draw.text((62, 235), "BPM", fill=PURPLE_LIGHT, font=font(8), anchor="mm")
+
+    spo2_color = MINT if spo2 >= 95 else GOLD if spo2 >= 90 else PINK_HOT
+    rrect(draw, 124, 196, 232, 238, 8, fill=PURPLE_DEEP, outline=spo2_color, width=1)
+    draw.text((178, 206), "SpO2", fill=spo2_color, font=font(8), anchor="mm")
+    draw.text((178, 224), f"{spo2}", fill=WHITE, font=font(16), anchor="mm")
+    draw.text((178, 235), "%", fill=PURPLE_LIGHT, font=font(8), anchor="mm")
+
+    # Pulse wave
+    draw.text((12, 244), "pulse wave", fill=PURPLE_LIGHT, font=font(8))
+    draw_pulse_wave(draw, all_irs, 8, 255, 224, 42, color=MINT)
+
+    # SpO2 bar
+    draw.text((12, 302), "SpO2 level", fill=PURPLE_LIGHT, font=font(8))
+    rrect(draw, 8, 312, 232, 328, 5, fill=PURPLE_DEEP, outline=PURPLE_MID, width=1)
+    bar_w = int((spo2 - 85) / 15 * 222)
+    if bar_w > 0:
+        rrect(draw, 9, 313, 9+bar_w, 327, 5, fill=spo2_color)
+    draw.text((240, 320), f"{spo2}%", fill=spo2_color, font=font(8), anchor="rm")
+
+    # Sparkles
+    for i, (sx, sy) in enumerate([(18,248),(228,248)]):
+        s = int(2 + 2 * math.sin(frame*0.2 + i))
+        draw_sparkle(draw, sx, sy, s, [PINK_HOT, MINT][i])
+
+    return img
+
+# ── Screen 4: Mood screen ──────────────────────────────────────
+def screen_mood(hr, spo2, mood, blink=False, frame=0):
+    img  = Image.new("RGB", (WIDTH, HEIGHT), BG_DARK)
+    draw = ImageDraw.Draw(img)
+    fill_gradient(draw, 0, HEIGHT, BG_DARK, BG_MID)
+
+    rrect(draw, 0, 0, WIDTH, 52, 0, fill=PURPLE_DEEP)
+    draw.line([(0,52),(WIDTH,52)], fill=PURPLE_LIGHT, width=2)
+    draw.text((WIDTH//2, 15), "ZEN DESK", fill=PURPLE_LIGHT, font=font(18), anchor="mm")
+    draw.text((WIDTH//2, 36), "mood analysis", fill=PINK_SOFT, font=font(10), anchor="mm")
+
+    # Big face
+    draw_face(draw, mood, 120, 175, blink=blink, frame=frame)
+
+    mood_labels = {"calm": "You seem Calm", "happy": "You seem Happy!",
+                   "excited": "You seem Excited!", "sleepy": "You seem Sleepy~"}
+    mood_colors = {"calm": PURPLE_LIGHT, "happy": MINT, "excited": PINK_HOT, "sleepy": PURPLE_MID}
+    draw.text((WIDTH//2, 240), mood_labels.get(mood,""), fill=mood_colors.get(mood, WHITE),
+              font=font(13), anchor="mm")
+
+    tips = {"calm":    "Great! Stay focused.",
+            "happy":   "Keep up the good vibes!",
+            "excited": "Channel that energy!",
+            "sleepy":  "Maybe take a short break."}
+    draw.text((WIDTH//2, 262), tips.get(mood,""), fill=PURPLE_LIGHT, font=font(10), anchor="mm")
+
+    draw.line([(20,278),(220,278)], fill=PURPLE_MID, width=1)
+    draw.text((WIDTH//2, 292), f"HR: {hr} BPM    SpO2: {spo2}%",
+              fill=PURPLE_LIGHT, font=font(10), anchor="mm")
+
+    for i, (sx, sy) in enumerate([(25,160),(215,160),(25,200),(215,200)]):
+        s = int(2 + 3 * math.sin(frame*0.15 + i*0.8))
+        c = [PINK_HOT, MINT, GOLD, PURPLE_LIGHT][i]
+        draw_sparkle(draw, sx, sy, s, c)
+
+    return img
+
+# ── Screen 5: Tip screen ───────────────────────────────────────
+def screen_tip(mood, hr):
+    img  = Image.new("RGB", (WIDTH, HEIGHT), BG_DARK)
+    draw = ImageDraw.Draw(img)
+    fill_gradient(draw, 0, HEIGHT, BG_DARK, BG_MID)
+
+    rrect(draw, 0, 0, WIDTH, 52, 0, fill=PURPLE_DEEP)
+    draw.line([(0,52),(WIDTH,52)], fill=GOLD, width=2)
+    draw.text((WIDTH//2, 15), "ZEN DESK", fill=GOLD, font=font(18), anchor="mm")
+    draw.text((WIDTH//2, 36), "wellness tip", fill=PURPLE_LIGHT, font=font(10), anchor="mm")
+
+    draw_sparkle(draw, WIDTH//2, 90, 18, GOLD)
+
+    tips_by_mood = {
+        "calm":    ["Breathe deeply.", "Stay hydrated!", "Great focus time.", "Try a short walk."],
+        "happy":   ["Share your joy!", "Stay active!", "Great energy today.", "Keep smiling!"],
+        "excited": ["Take 3 deep breaths.", "Focus your energy.", "Stay grounded.", "Channel it!"],
+        "sleepy":  ["Rest if you can.", "Try cold water.", "Stretch a bit.", "Deep breaths help."],
+    }
+    tip_list = tips_by_mood.get(mood, ["Stay well!"])
+    tip = tip_list[int(time.time()) % len(tip_list)]
+
+    rrect(draw, 20, 115, 220, 200, 12, fill=PURPLE_DEEP, outline=GOLD, width=2)
+    words = tip.split()
+    line, lines = "", []
+    for w in words:
+        if len(line + w) < 20:
+            line += w + " "
+        else:
+            lines.append(line.strip())
+            line = w + " "
+    lines.append(line.strip())
+    for j, l in enumerate(lines):
+        draw.text((WIDTH//2, 148 + j*20), l, fill=GOLD, font=font(14), anchor="mm")
+
+    draw.line([(20,215),(220,215)], fill=PURPLE_MID, width=1)
+    draw.text((WIDTH//2, 235), "Did you know?", fill=MINT, font=font(12), anchor="mm")
+    facts = [
+        "Normal HR: 60-100 BPM",
+        "Normal SpO2: 95-100%",
+        "Deep breathing lowers HR",
+        "Exercise improves SpO2",
+    ]
+    fact = facts[int(time.time() // 5) % len(facts)]
+    rrect(draw, 15, 250, 225, 300, 8, fill=BG_MID, outline=MINT, width=1)
+    draw.text((WIDTH//2, 275), fact, fill=PURPLE_LIGHT, font=font(10), anchor="mm")
+
+    draw.text((WIDTH//2, 315), "measuring again soon...",
+              fill=PURPLE_MID, font=font(9), anchor="mm")
+    return img
+
+# ══════════════════════════════════════════════════════════════
+# MAIN LOOP
+# ══════════════════════════════════════════════════════════════
+init_display()
+init_sensor()
+print("Zen Desk started!")
+
+frame = 0
+
+try:
+    while True:
+        # ── SCREEN 2: Wait for finger ──────────────────────────
+        print("Waiting for finger...")
+        frame = 0
+        while True:
+            # Show place-finger animation
+            show_image(screen_place_finger(frame))
+            frame = (frame + 1) % 200
+
+            # Check for finger multiple times per frame
+            found = False
+            for _ in range(5):
+                s = read_one_sample()
+                if s is not None and s[1] > 50000:
+                    found = True
+                    break
+                time.sleep(0.01)
+
+            if found:
+                print("Finger detected!")
+                break
+
+            time.sleep(0.05)
+
+        # ── Warm-up: discard first 25 samples ─────────────────
+        print("Warming up sensor...")
+        flush_fifo()
+        for _ in range(25):
+            read_one_sample()
+            time.sleep(0.04)
+
+        # ── Collect 100 samples at 25Hz (~4 sec) ──────────────
+        print("Collecting samples...")
+        all_reds, all_irs = [], []
+        finger_lost = False
+
+        for sec in range(10, 0, -1):
+            for sub in range(25):  # 25 samples per second
+                t0 = time.time()
+                s = None
+                wait = 0
+                while s is None and wait < 15:
+                    s = read_one_sample()
+                    wait += 1
+                    time.sleep(0.004)
+
+                if s is None:
+                    continue
+
+                red, ir = s
+                if ir < 30000:
+                    print("Finger lost!")
+                    finger_lost = True
+                    break
+
+                all_reds.append(red)
+                all_irs.append(ir)
+
+                if sub % 5 == 0:
+                    show_image(screen_measuring(sec, all_reds, all_irs, frame))
+                    frame += 1
+
+                elapsed = time.time() - t0
+                time.sleep(max(0, 0.04 - elapsed))
+
+            if finger_lost:
+                break
+
+        if finger_lost:
+            continue
+
+        if len(all_irs) < 20:
+            print(f"Not enough data: {len(all_irs)} samples")
+            continue
+
+        # ── Calculate ──────────────────────────────────────────
+        hr   = calculate_hr(all_irs, sample_rate=25)
+        spo2 = calculate_spo2(all_reds, all_irs)
+        mood = get_mood(hr)
+        print(f"Result: HR={hr}  SpO2={spo2}  Mood={mood}")
+
+        # ── SCREEN 4: Vitals (10 sec) ──────────────────────────
+        t = time.time()
+        blink = False
+        while time.time() - t < 10:
+            show_image(screen_vitals(hr, spo2, mood, all_irs, blink, frame))
+            blink = not blink
+            frame += 1
+            time.sleep(0.6)
+
+        # ── SCREEN 5: Mood (8 sec) ─────────────────────────────
+        t = time.time()
+        blink = False
+        frame = 0
+        while time.time() - t < 8:
+            show_image(screen_mood(hr, spo2, mood, blink, frame))
+            blink = not blink
+            frame += 1
+            time.sleep(0.5)
+
+        # ── SCREEN 6: Tip (5 sec) ──────────────────────────────
+        t = time.time()
+        while time.time() - t < 5:
+            show_image(screen_tip(mood, hr))
+            time.sleep(0.2)
+
+except KeyboardInterrupt:
+    GPIO.cleanup()
+    print("Zen Desk stopped.")
