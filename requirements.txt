@@ -1,0 +1,5 @@
+Pillow>=10.0.0
+smbus2>=0.4.0
+spidev>=3.6
+# Install on Raspberry Pi only (needs system libs):
+# RPi.GPIO
